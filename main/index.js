@@ -1,6 +1,6 @@
-const {readFile, writeFile} = require('fs/promises')
+const {readFile, readdir, writeFile} = require('fs/promises')
 const os = require('os')
-const {basename, dirname, join} = require('path')
+const {basename, dirname, join, relative} = require('path')
 const {app, BrowserWindow, dialog, ipcMain, Menu, shell} = require('electron')
 const {default: Conf} = require('conf')
 const Papa = require('papaparse')
@@ -11,6 +11,7 @@ const {PropertyType} = require('../lib/uexport')
 const UPACKAGE_OPEN_DIALOG_DEFAULT_PATH_ID = 'upackageOpenDialogDefaultPath'
 const UPACKAGE_SAVE_DIALOG_DEFAULT_PATH_ID = 'upackageSaveDialogDefaultPath'
 const CSV_DIALOG_DEFAULT_PATH_ID = 'csvFileDialogDefaultPath'
+const CSV_FOLDER_DIALOG_DEFAULT_PATH_ID = 'csvFolderDialogDefaultPath'
 
 const conf = new Conf()
 
@@ -77,6 +78,10 @@ function createMainWindow() {
           enabled: false,
           accelerator: 'Control+E',
           click: exportCSV,
+        },
+        {
+          label: 'Export Folder to CSV...',
+          click: exportFolderCSV,
         },
         {type: 'separator'},
         {role: 'quit'},
@@ -430,81 +435,13 @@ ipcMain.on('csv-exported', (event, entries) => {
  */
 async function csvExported(entries) {
   try {
-    const {response} = await dialog.showMessageBox(mainWindow, {
-      title: 'How should numbers be exported?',
-      message:
-        'Microsoft Excel and Google Sheets do not preserve numbers correctly unless they are exported as text formulas. Other CSV applications may not be able to read numbers as text formulas.',
-      buttons: [
-        'Export numbers as text formulas',
-        'Export numbers as-is',
-        'Cancel',
-      ],
-    })
-
-    let exportNumbersAsText
-    switch (response) {
-      case 0:
-        exportNumbersAsText = true
-        break
-      case 1:
-        exportNumbersAsText = false
-        break
-      case 2:
-        return
+    const exportNumbersAsText = await chooseCSVNumberFormat()
+    if (exportNumbersAsText == null) {
+      return
     }
 
     const {uexp} = upackage
-    const {props} = uexp
-    const fields = ['Tag']
-    const data = []
-    const columnSizes = {Tag: 1}
-
-    for (let i = 0; i < entries.length; i++) {
-      const entry = entries[i]
-      const line = {Tag: entry.$tag}
-      for (const prop of props) {
-        const value = entry[prop.name]
-        if (prop.name.endsWith('_Array')) {
-          for (let j = 0; j < value.length; j++) {
-            const field = `${prop.name}[${j}]`
-            const element = value[j]
-
-            if (typeof value === 'number' && exportNumbersAsText) {
-              line[field] = `="${element}"`
-            } else {
-              line[field] = element
-            }
-          }
-
-          if (
-            columnSizes[prop.name] == null ||
-            columnSizes[prop.name] < value.length
-          ) {
-            columnSizes[prop.name] = value.length
-          }
-        } else {
-          if (typeof value === 'number' && exportNumbersAsText) {
-            line[prop.name] = `="${value}"`
-          } else {
-            line[prop.name] = value
-          }
-        }
-      }
-
-      data.push(line)
-    }
-
-    for (const prop of props) {
-      if (prop.name.endsWith('_Array')) {
-        for (let i = 0; i < columnSizes[prop.name]; i++) {
-          fields.push(`${prop.name}[${i}]`)
-        }
-      } else {
-        fields.push(prop.name)
-      }
-    }
-
-    const csv = Papa.unparse({fields, data})
+    const csv = createCSV(uexp.props, entries, exportNumbersAsText)
 
     let defaultPath = conf.get(CSV_DIALOG_DEFAULT_PATH_ID)
     if (defaultPath == null) {
@@ -532,6 +469,189 @@ async function csvExported(entries) {
   } catch (err) {
     reportError(err)
   }
+}
+
+async function chooseCSVNumberFormat() {
+  const {response} = await dialog.showMessageBox(mainWindow, {
+    title: 'How should numbers be exported?',
+    message:
+      'Microsoft Excel and Google Sheets do not preserve numbers correctly unless they are exported as text formulas. Other CSV applications may not be able to read numbers as text formulas.',
+    buttons: [
+      'Export numbers as text formulas',
+      'Export numbers as-is',
+      'Cancel',
+    ],
+  })
+
+  if (response === 0) {
+    return true
+  }
+  if (response === 1) {
+    return false
+  }
+  return null
+}
+
+async function exportFolderCSV() {
+  try {
+    const {canceled, filePaths} = await dialog.showOpenDialog({
+      defaultPath:
+        conf.get(CSV_FOLDER_DIALOG_DEFAULT_PATH_ID) ||
+        conf.get(UPACKAGE_OPEN_DIALOG_DEFAULT_PATH_ID),
+      properties: ['openDirectory'],
+    })
+    if (canceled) {
+      return
+    }
+
+    const folder = filePaths[0]
+    conf.set(CSV_FOLDER_DIALOG_DEFAULT_PATH_ID, folder)
+    const rootEntries = await readdir(folder, {withFileTypes: true})
+    let includeSubfolders = false
+    if (rootEntries.some(entry => entry.isDirectory())) {
+      const {response} = await dialog.showMessageBox(mainWindow, {
+        title: 'Export folder to CSV',
+        message: 'Include files in subfolders?',
+        buttons: ['Selected folder only', 'Include subfolders', 'Cancel'],
+        defaultId: 0,
+        cancelId: 2,
+      })
+      if (response === 2) {
+        return
+      }
+      includeSubfolders = response === 1
+    }
+
+    const failures = []
+    const files = await findUAssetFiles(
+      folder,
+      rootEntries,
+      includeSubfolders,
+      failures,
+    )
+    if (files.length === 0 && failures.length === 0) {
+      await dialog.showMessageBox(mainWindow, {
+        message: 'No UAsset files found in the selected folder.',
+      })
+      return
+    }
+
+    let exportNumbersAsText
+    if (files.length > 0) {
+      exportNumbersAsText = await chooseCSVNumberFormat()
+      if (exportNumbersAsText == null) {
+        return
+      }
+    }
+
+    let exported = 0
+    for (const source of files) {
+      try {
+        const target = source.replace(/\.uasset$/, '.csv')
+        const packageToExport = new UPackage(source)
+        await packageToExport.read()
+        const {props, entries} = packageToExport.uexp
+        await writeFile(target, createCSV(props, entries, exportNumbersAsText))
+        exported++
+      } catch (err) {
+        failures.push(`${relative(folder, source)}: ${err.message}`)
+      }
+    }
+
+    await dialog.showMessageBox(mainWindow, {
+      type: failures.length > 0 ? 'warning' : 'info',
+      message: `Exported ${exported} of ${files.length} CSV files.`,
+      detail: failures.join('\n'),
+    })
+  } catch (err) {
+    reportError(err)
+  }
+}
+
+async function findUAssetFiles(
+  folder,
+  rootEntries,
+  includeSubfolders,
+  failures,
+) {
+  const files = []
+  const directories = [folder]
+  while (directories.length > 0) {
+    const directory = directories.pop()
+    let entries
+    try {
+      entries =
+        directory === folder
+          ? rootEntries
+          : await readdir(directory, {withFileTypes: true})
+    } catch (err) {
+      failures.push(`${relative(folder, directory)}: ${err.message}`)
+      continue
+    }
+
+    for (const entry of entries) {
+      const filename = join(directory, entry.name)
+      if (entry.isDirectory() && includeSubfolders) {
+        directories.push(filename)
+      } else if (entry.isFile() && entry.name.endsWith('.uasset')) {
+        files.push(filename)
+      }
+    }
+  }
+
+  return files
+}
+
+/**
+ * @param {import('../lib/uexport').Property[]} props
+ * @param {import('../renderer/preload').SparseEntry[]} entries
+ * @param {boolean} exportNumbersAsText
+ */
+function createCSV(props, entries, exportNumbersAsText) {
+  const fields = ['Tag']
+  const data = []
+  const columnSizes = {Tag: 1}
+
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i]
+    const line = {Tag: entry.$tag}
+    for (const prop of props) {
+      const value = entry[prop.name]
+      if (prop.name.endsWith('_Array')) {
+        for (let j = 0; j < value.length; j++) {
+          const field = `${prop.name}[${j}]`
+          line[field] = value[j]
+        }
+
+        if (
+          columnSizes[prop.name] == null ||
+          columnSizes[prop.name] < value.length
+        ) {
+          columnSizes[prop.name] = value.length
+        }
+      } else {
+        if (typeof value === 'number' && exportNumbersAsText) {
+          line[prop.name] = `="${value}"`
+        } else {
+          line[prop.name] = value
+        }
+      }
+    }
+
+    data.push(line)
+  }
+
+  for (const prop of props) {
+    if (prop.name.endsWith('_Array')) {
+      for (let i = 0; i < columnSizes[prop.name]; i++) {
+        fields.push(`${prop.name}[${i}]`)
+      }
+    } else {
+      fields.push(prop.name)
+    }
+  }
+
+  return Papa.unparse({fields, data})
 }
 
 /**
