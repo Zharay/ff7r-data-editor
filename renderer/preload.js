@@ -499,7 +499,7 @@ function saveUPackage() {
   try {
     // Focus away from entries to ensure they are saved.
     document.getElementById('save-file-button').focus()
-    const entries = getEntries()
+    const entries = getEntries({dirtyOnly: false})
     ipcRenderer.send('upackage-saved', entries)
   } catch (err) {
     ipcRenderer.send('error', err)

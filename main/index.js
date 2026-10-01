@@ -186,7 +186,7 @@ async function upackageSaved(entries) {
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i]
       for (const prop of uexp.props) {
-        if (entry[prop.name] != null) {
+        if (prop.type !== PropertyType.STRING && entry[prop.name] != null) {
           if (prop.name.endsWith('_Array')) {
             const elements = entry[prop.name]
             for (let j = 0; j < elements.length; j++) {
