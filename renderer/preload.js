@@ -568,6 +568,7 @@ function showToast(message) {
 function setupFind() {
   const found = []
   let foundIndex = 0
+  let searchableText = new WeakMap()
   /** @type {HTMLTableElement} */
   const entries = document.getElementById('entries')
   const form = document.getElementById('find-form')
@@ -579,26 +580,39 @@ function setupFind() {
 
   function findAll() {
     const regexp = new RegExp(escapeRegExp(textbox.value), 'i')
+    if (found.length > 0) {
+      found[foundIndex].classList.remove('current')
+    }
+    for (const cell of found) {
+      cell.classList.remove('found')
+    }
     found.length = 0
+    if (textbox.value.length === 0) {
+      totalSpan.innerText = '0'
+      indexSpan.innerText = '0'
+      return
+    }
+
     for (const row of entries.rows) {
       for (const cell of row.cells) {
-        cell.classList.remove('current')
-        const isFound = textbox.value.length > 0 && regexp.test(cell.innerText)
-        if (isFound) {
+        let text = searchableText.get(cell)
+        if (text == null) {
+          text = cell.innerText
+          searchableText.set(cell, text)
+        }
+        if (regexp.test(text)) {
           cell.classList.add('found')
           found.push(cell)
-        } else {
-          cell.classList.remove('found')
         }
       }
+    }
 
-      totalSpan.innerText = String(found.length)
+    totalSpan.innerText = String(found.length)
 
-      if (found.length > 0) {
-        setFound()
-      } else {
-        indexSpan.innerText = String(0)
-      }
+    if (found.length > 0) {
+      setFound()
+    } else {
+      indexSpan.innerText = String(0)
     }
   }
 
@@ -689,6 +703,21 @@ function setupFind() {
     foundIndex = 0
     findAll()
   })
+
+  function invalidateCell(event) {
+    const cell = event.target.closest('td')
+    if (cell != null) {
+      searchableText.delete(cell)
+    }
+  }
+
+  entries.addEventListener('input', invalidateCell)
+  entries.addEventListener('focusout', invalidateCell)
+  document
+    .getElementById('show-txt-ids-checkbox')
+    .addEventListener('change', () => {
+      searchableText = new WeakMap()
+    })
 
   textbox.addEventListener('keydown', event => {
     if (event.shiftKey) {
